@@ -14,6 +14,7 @@ import tempfile
 import asyncio
 from inotify_simple import INotify
 from inotify_simple import flags as iFlags
+from .pre_process import PreProcessor
 
 # Annotation imports
 from typing import (
@@ -495,6 +496,13 @@ class FileManager:
         # Don't start if another print is currently in progress
         start_print = start_print and not print_ongoing
         self.notify_sync_lock = NotifySyncLock(upload_info['dest_path'])
+        tmp_processed_file = upload_info['tmp_file_path'] + ".pp"
+        processor = PreProcessor()
+        processor.process(upload_info['tmp_file_path'], tmp_processed_file)
+        tmp_orig_file = upload_info['tmp_file_path']
+        upload_info['tmp_file_path'] = tmp_processed_file
+        os.remove(tmp_orig_file)
+
         finfo = await self._process_uploaded_file(upload_info)
         await self.gcode_metadata.parse_metadata(
             upload_info['filename'], finfo).wait()
