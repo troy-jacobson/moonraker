@@ -520,7 +520,7 @@ class FileManager:
         finfo = self.get_path_info(final_dest_path)
         logging.info("parse metadata")
         await self.gcode_metadata.parse_metadata(
-            final_dest_path, finfo).wait()
+            upload_info['filename'] , finfo).wait()
         if start_print:
             # Make a Klippy Request to "Start Print"
             kapis: APIComp = self.server.lookup_component('klippy_apis')
