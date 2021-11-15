@@ -16,7 +16,13 @@ import concurrent
 import zipfile
 from inotify_simple import INotify
 from inotify_simple import flags as iFlags
-from preprocess_cancellation import preprocessor
+
+has_preprocess_cancellation = False
+try:
+    from preprocess_cancellation import preprocessor
+    has_preprocess_cancellation = True
+except ImportError:
+    logging.exception("Unable to load the preprocess_cancellation module.")
 
 # Annotation imports
 from typing import (
@@ -599,7 +605,10 @@ class FileManager:
                     return
 
         intermediate_dest_path = pre_process_file
-        if exclude_object_enabled:
+        if exclude_object_enabled and not has_preprocess_cancellation:
+            logging.warning("Unalbe to process file for cancellation because the preprocessor package is not installed.")
+
+        if exclude_object_enabled and has_preprocess_cancellation:
             intermediate_dest_path = pre_process_file + ".pp"
             logging.info("processing for cancellation")
             logging.info(intermediate_dest_path)
