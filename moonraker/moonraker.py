@@ -15,6 +15,7 @@ import time
 import socket
 import logging
 import json
+import getpass
 import signal
 import confighelper
 import utils
@@ -52,7 +53,9 @@ MAX_LOG_ATTEMPTS = 10 * LOG_ATTEMPT_INTERVAL
 
 CORE_COMPONENTS = [
     'database', 'file_manager', 'klippy_apis', 'machine',
-    'data_store', 'shell_command', 'proc_stats']
+    'data_store', 'shell_command', 'proc_stats', 'job_state',
+    'job_queue'
+]
 
 SENTINEL = SentinelClass.get_instance()
 
@@ -99,6 +102,7 @@ class Server:
         self.init_attempts: int = 0
         self.klippy_state: str = "disconnected"
         self.klippy_disconnect_evt: Optional[asyncio.Event] = None
+        self.connection_init_lock: asyncio.Lock = asyncio.Lock()
         self.subscriptions: Dict[Subscribable, Dict[str, Any]] = {}
         self.failed_components: List[str] = []
         self.warnings: List[str] = []
@@ -143,6 +147,9 @@ class Server:
         self._load_components(config)
         self.klippy_apis: KlippyAPI = self.lookup_component('klippy_apis')
         config.validate_config()
+        self.event_loop.add_signal_handler(
+            signal.SIGTERM, self._handle_term_signal)
+        self.event_loop.register_callback(self._start_server)
 
     def get_app_args(self) -> Dict[str, Any]:
         return dict(self.app_args)
@@ -150,16 +157,34 @@ class Server:
     def get_event_loop(self) -> EventLoop:
         return self.event_loop
 
-    def start(self) -> None:
+    async def _start_server(self):
+        optional_comps: List[Coroutine] = []
+        for name, component in self.components.items():
+            if not hasattr(component, "component_init"):
+                continue
+            if name in CORE_COMPONENTS:
+                # Process core components in order synchronously
+                await self._initialize_component(name, component)
+            else:
+                optional_comps.append(
+                    self._initialize_component(name, component))
+
+        # Asynchronous Optional Component Initialization
+        if optional_comps:
+            await asyncio.gather(*optional_comps)
+
+        # Start HTTP Server
         hostname, hostport = self.get_host_info()
         logging.info(
             f"Starting Moonraker on ({self.host}, {hostport}), "
             f"Hostname: {hostname}")
         self.moonraker_app.listen(self.host, self.port, self.ssl_port)
         self.server_running = True
-        self.event_loop.add_signal_handler(
-            signal.SIGTERM, self._handle_term_signal)
-        self.event_loop.register_callback(self._connect_klippy)
+        await self._connect_klippy()
+
+    async def wait_connection_initialized(self) -> None:
+        async with self.connection_init_lock:
+            return
 
     def add_log_rollover_item(self, name: str, item: str,
                               log: bool = True) -> None:
@@ -174,15 +199,29 @@ class Server:
             logging.warning(warning)
 
     # ***** Component Management *****
+    async def _initialize_component(self, name: str, component: Any) -> None:
+        logging.info(f"Performing Component Post Init: [{name}]")
+        try:
+            ret = component.component_init()
+            if ret is not None:
+                await ret
+        except Exception as e:
+            self.add_warning(f"Component '{name}' failed to load with "
+                             f"error: {e}")
+            self.set_failed_component(name)
+
     def _load_components(self, config: confighelper.ConfigHelper) -> None:
+        cfg_sections = [s.split()[0] for s in config.sections()]
+        cfg_sections.remove('server')
+
         # load core components
         for component in CORE_COMPONENTS:
             self.load_component(config, component)
+            if component in cfg_sections:
+                cfg_sections.remove(component)
 
-        # check for optional components
-        opt_sections = set([s.split()[0] for s in config.sections()])
-        opt_sections.remove('server')
-        for section in opt_sections:
+        # load remaining optional components
+        for section in cfg_sections:
             self.load_component(config, section, None)
 
     def load_component(self,
@@ -194,13 +233,9 @@ class Server:
             return self.components[component_name]
         try:
             module = importlib.import_module("components." + component_name)
-            func_name = "load_component"
-            if hasattr(module, "load_component_multi"):
-                func_name = "load_component_multi"
-            if component_name not in CORE_COMPONENTS and \
-                    func_name == "load_component":
+            if component_name in config:
                 config = config[component_name]
-            load_func = getattr(module, func_name)
+            load_func = getattr(module, "load_component")
             component = load_func(config)
         except Exception:
             msg = f"Unable to load component: ({component_name})"
@@ -239,10 +274,26 @@ class Server:
                                ) -> None:
         self.events.setdefault(event, []).append(callback)
 
-    def send_event(self, event: str, *args) -> None:
+    def send_event(self, event: str, *args) -> asyncio.Future:
+        fut = self.event_loop.create_future()
+        self.event_loop.register_callback(
+            self._process_event, fut, event, *args)
+        return fut
+
+    async def _process_event(self,
+                             fut: asyncio.Future,
+                             event: str,
+                             *args
+                             ) -> None:
         events = self.events.get(event, [])
-        for evt in events:
-            self.event_loop.register_callback(evt, *args)
+        coroutines: List[Coroutine] = []
+        for func in events:
+            ret = func(*args)
+            if ret is not None:
+                coroutines.append(ret)
+        if coroutines:
+            await asyncio.gather(*coroutines)
+        fut.set_result(None)
 
     def register_remote_method(self,
                                method_name: str,
@@ -276,8 +327,8 @@ class Server:
         if not ret:
             self.event_loop.delay_callback(.25, self._connect_klippy)
             return
-        # begin server iniialization
-        self.event_loop.register_callback(self._initialize)
+        self.init_handle = self.event_loop.delay_callback(
+            0.01, self._init_klippy_connection)
 
     def process_command(self, cmd: Dict[str, Any]) -> None:
         method = cmd.get('method', None)
@@ -333,41 +384,46 @@ class Server:
         if self.klippy_disconnect_evt is not None:
             self.klippy_disconnect_evt.set()
 
-    async def _initialize(self) -> None:
+    async def _init_klippy_connection(self) -> None:
         if not self.server_running:
             return
-        await self._check_ready()
-        await self._request_endpoints()
-        # Subscribe to "webhooks"
-        # Register "webhooks" subscription
-        if "webhooks_sub" not in self.init_list:
-            try:
-                await self.klippy_apis.subscribe_objects({'webhooks': None})
-            except ServerError as e:
-                logging.info(f"{e}\nUnable to subscribe to webhooks object")
+        async with self.connection_init_lock:
+            await self._check_ready()
+            await self._request_endpoints()
+            # Subscribe to "webhooks"
+            # Register "webhooks" subscription
+            if "webhooks_sub" not in self.init_list:
+                try:
+                    await self.klippy_apis.subscribe_objects(
+                        {'webhooks': None})
+                except ServerError as e:
+                    logging.info(
+                        f"{e}\nUnable to subscribe to webhooks object")
+                else:
+                    logging.info("Webhooks Subscribed")
+                    self.init_list.append("webhooks_sub")
+            # Subscribe to Gcode Output
+            if "gcode_output_sub" not in self.init_list:
+                try:
+                    await self.klippy_apis.subscribe_gcode_output()
+                except ServerError as e:
+                    logging.info(
+                        f"{e}\nUnable to register gcode output subscription")
+                else:
+                    logging.info("GCode Output Subscribed")
+                    self.init_list.append("gcode_output_sub")
+            if (
+                "startup_complete" in self.init_list or
+                not self.klippy_connection.is_connected()
+            ):
+                # Either Klippy is ready or the connection dropped
+                # during initialization.  Exit initialization
+                self.init_attempts = 0
+                self.init_handle = None
             else:
-                logging.info("Webhooks Subscribed")
-                self.init_list.append("webhooks_sub")
-        # Subscribe to Gcode Output
-        if "gcode_output_sub" not in self.init_list:
-            try:
-                await self.klippy_apis.subscribe_gcode_output()
-            except ServerError as e:
-                logging.info(
-                    f"{e}\nUnable to register gcode output subscription")
-            else:
-                logging.info("GCode Output Subscribed")
-                self.init_list.append("gcode_output_sub")
-        if "klippy_ready" in self.init_list or \
-                not self.klippy_connection.is_connected():
-            # Either Klippy is ready or the connection dropped
-            # during initialization.  Exit initialization
-            self.init_attempts = 0
-            self.init_handle = None
-        else:
-            self.init_attempts += 1
-            self.init_handle = self.event_loop.delay_callback(
-                INIT_TIME, self._initialize)
+                self.init_attempts += 1
+                self.init_handle = self.event_loop.delay_callback(
+                    INIT_TIME, self._init_klippy_connection)
 
     async def _request_endpoints(self) -> None:
         result = await self.klippy_apis.list_endpoints(default=None)
@@ -394,22 +450,24 @@ class Server:
         self.klippy_state = result.get('state', "unknown")
         if send_id:
             self.init_list.append("identified")
-            self.send_event("server:klippy_identified")
-        if self.klippy_state == "ready":
-            await self._verify_klippy_requirements()
-            logging.info("Klippy ready")
-            self.init_list.append('klippy_ready')
-            # register methods with klippy
-            for method in self.klippy_reg_methods:
-                try:
-                    await self.klippy_apis.register_method(method)
-                except ServerError:
-                    logging.exception(f"Unable to register method '{method}'")
-            self.send_event("server:klippy_ready")
-        elif self.init_attempts % LOG_ATTEMPT_INTERVAL == 0 and \
-                self.init_attempts <= MAX_LOG_ATTEMPTS:
-            msg = result.get('state_message', "Klippy Not Ready")
-            logging.info("\n" + msg)
+            await self.send_event("server:klippy_identified")
+        if self.klippy_state != "startup":
+            self.init_list.append('startup_complete')
+            await self.send_event("server:klippy_started", self.klippy_state)
+            if self.klippy_state != "ready":
+                msg = result.get('state_message', "Klippy Not Ready")
+                logging.info("\n" + msg)
+            else:
+                await self._verify_klippy_requirements()
+                # register methods with klippy
+                for method in self.klippy_reg_methods:
+                    try:
+                        await self.klippy_apis.register_method(method)
+                    except ServerError:
+                        logging.exception(
+                            f"Unable to register method '{method}'")
+                logging.info("Klippy ready")
+                await self.send_event("server:klippy_ready")
 
     async def _verify_klippy_requirements(self) -> None:
         result = await self.klippy_apis.get_object_list(default=None)
@@ -438,7 +496,8 @@ class Server:
                 if vsd_path is not None:
                     file_manager: FileManager = self.lookup_component(
                         'file_manager')
-                    file_manager.register_directory('gcodes', vsd_path)
+                    file_manager.register_directory('gcodes', vsd_path,
+                                                    full_access=True)
                 else:
                     logging.info(
                         "Configuration for [virtual_sdcard] not found,"
@@ -463,12 +522,11 @@ class Server:
             conn_status: Dict[str, Any] = {}
             for name, fields in sub.items():
                 if name in status:
-                    val: Dict[str, Any] = status[name]
-                    if fields is None:
-                        conn_status[name] = dict(val)
-                    else:
-                        conn_status[name] = {
-                            k: v for k, v in val.items() if k in fields}
+                    val: Dict[str, Any] = dict(status[name])
+                    if fields is not None:
+                        val = {k: v for k, v in val.items() if k in fields}
+                    if val:
+                        conn_status[name] = val
             conn.send_status(conn_status, eventtime)
 
     async def make_request(self, web_request: WebRequest) -> Any:
@@ -611,11 +669,10 @@ class Server:
             'klippy_state': self.klippy_state,
             'components': list(self.components.keys()),
             'failed_components': self.failed_components,
-            'plugins': list(self.components.keys()),
-            'failed_plugins': self.failed_components,
             'registered_directories': reg_dirs,
             'warnings': self.warnings,
-            'websocket_count': self.get_websocket_manager().get_count()
+            'websocket_count': self.get_websocket_manager().get_count(),
+            'moonraker_version': self.app_args['software_version']
         }
 
     async def _handle_config_request(self,
@@ -635,8 +692,20 @@ class KlippyConnection:
         self.on_recd = on_recd
         self.on_close = on_close
         self.event_loop = event_loop
+        self.log_no_access = True
 
     async def connect(self, address: str) -> bool:
+        if not os.path.exists(address):
+            return False
+        if not os.access(address, os.R_OK | os.W_OK):
+            if self.log_no_access:
+                user = getpass.getuser()
+                logging.info(
+                    f"Cannot connect to Klippy, Linux user '{user}' lacks "
+                    f"permission to open Unix Domain Socket: {address}")
+                self.log_no_access = False
+            return False
+        self.log_no_access = True
         ksock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         kstream = iostream.IOStream(ksock)
         try:
@@ -764,7 +833,6 @@ def main() -> None:
             estatus = 1
             break
         try:
-            server.start()
             event_loop.start()
         except Exception:
             logging.exception("Server Running Error")
@@ -777,7 +845,18 @@ def main() -> None:
         # it is ok to use a blocking sleep here
         time.sleep(.5)
         logging.info("Attempting Server Restart...")
-        asyncio.set_event_loop(asyncio.new_event_loop())
+        for _ in range(5):
+            # Sometimes the new loop does not properly instantiate.
+            # Give 5 attempts before raising an exception
+            new_loop = asyncio.new_event_loop()
+            if not new_loop.is_closed():
+                break
+            logging.info("Failed to create open eventloop, "
+                         "retyring in .5 seconds...")
+            time.sleep(.5)
+        else:
+            raise RuntimeError("Unable to create new open eventloop")
+        asyncio.set_event_loop(new_loop)
         event_loop = EventLoop()
     event_loop.close()
     logging.info("Server Shutdown")

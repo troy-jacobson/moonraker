@@ -1,4 +1,4 @@
-# MQTT client implemenation for Moonraker
+# MQTT client implementation for Moonraker
 #
 # Copyright (C) 2021  Eric Callahan <arksine.code@gmail.com>
 #
@@ -12,7 +12,7 @@ import json
 import pathlib
 from collections import deque
 import paho.mqtt.client as paho_mqtt
-from websockets import WebRequest, JsonRPC, APITransport
+from websockets import Subscribable, WebRequest, JsonRPC, APITransport
 
 # Annotation imports
 from typing import (
@@ -131,7 +131,7 @@ class AIOHelper:
         logging.info("MQTT Misc Loop Complete")
 
 
-class MQTTClient(APITransport):
+class MQTTClient(APITransport, Subscribable):
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.event_loop = self.server.get_event_loop()
@@ -186,11 +186,36 @@ class MQTTClient(APITransport):
             self._handle_subscription_request,
             transports=["http", "websocket"])
 
-
         # Subscribe to API requests
         self.json_rpc = JsonRPC(transport="MQTT")
         self.api_request_topic = f"{self.instance_name}/moonraker/api/request"
         self.api_resp_topic = f"{self.instance_name}/moonraker/api/response"
+        self.klipper_status_topic = f"{self.instance_name}/klipper/status"
+        self.moonraker_status_topic = f"{self.instance_name}/moonraker/status"
+        status_cfg = config.get("status_objects", None)
+        self.status_objs: Dict[str, Any] = {}
+        if status_cfg is not None:
+            for line in status_cfg.strip().split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split('=', 1)
+                fields: Optional[List[str]]
+                if len(parts) == 1:
+                    fields = None
+                if len(parts) == 2:
+                    fields = [f.strip() for f in parts[1].split(',')
+                              if f.strip()]
+                elif len(parts) != 1:
+                    raise config.error(
+                        "Format error in option 'status_object', "
+                        f"section [mqtt]:\n{status_cfg}")
+                self.status_objs[parts[0].strip()] = fields
+            logging.debug(f"MQTT: Status Objects Set: {self.status_objs}")
+
+            self.server.register_event_handler("server:klippy_identified",
+                                               self._handle_klippy_identified)
+
         self.timestamp_deque: Deque = deque(maxlen=20)
         self.api_qos = config.getint('api_qos', self.qos)
         if config.getboolean("enable_moonraker_api", True):
@@ -205,33 +230,42 @@ class MQTTClient(APITransport):
                 f"Moonraker API topics - Request: {self.api_request_topic}, "
                 f"Response: {self.api_resp_topic}")
 
-        self.event_loop.register_callback(self._initialize)
-
-    async def _initialize(self) -> None:
+    async def component_init(self) -> None:
         # We must wait for the IOLoop (asyncio event loop) to start
         # prior to retreiving it
         self.helper = AIOHelper(self.client)
         if self.user_name is not None:
             self.client.username_pw_set(self.user_name, self.password)
-        retries = 15
-        while retries:
+        self.client.will_set(self.moonraker_status_topic,
+                             payload=json.dumps({'server': 'offline'}),
+                             qos=self.qos, retain=True)
+        retries = 5
+        for _ in range(retries):
             try:
                 self.client.connect(self.address, self.port)
             except ConnectionRefusedError:
-                retries -= 1
-                if retries:
-                    logging.info("Unable to connect to MQTT broker, "
-                                 f"retries remaining: {retries}")
-                    await asyncio.sleep(2.)
-                    continue
-                self.server.set_failed_component("mqtt")
-                self.server.add_warning(
-                    f"MQTT Broker Connection at ({self.address}, {self.port}) "
-                    "refused. Check your client and broker configuration.")
-                return
-            break
+                logging.info("Unable to connect to MQTT broker, "
+                             f"retries remaining: {retries}")
+                await asyncio.sleep(2.)
+            else:
+                break
+        else:
+            self.server.set_failed_component("mqtt")
+            self.server.add_warning(
+                f"MQTT Broker Connection at ({self.address}, {self.port}) "
+                "refused. Check your client and broker configuration.")
+            return
         self.client.socket().setsockopt(
             socket.SOL_SOCKET, socket.SO_SNDBUF, 2048)
+
+    async def _handle_klippy_identified(self) -> None:
+        if self.status_objs:
+            args = {'objects': self.status_objs}
+            try:
+                await self.server.make_request(
+                    WebRequest("objects/subscribe", args, conn=self))
+            except self.server.error:
+                pass
 
     def _on_message(self,
                     client: str,
@@ -258,6 +292,8 @@ class MQTTClient(APITransport):
                     ) -> None:
         logging.info("MQTT Client Connected")
         if reason_code == 0:
+            self.publish_topic(self.moonraker_status_topic,
+                               {'server': 'online'}, retain=True)
             subs = [(k, v[0]) for k, v in self.subscribed_topics.items()]
             if subs:
                 res, msg_id = client.subscribe(subs)
@@ -574,12 +610,24 @@ class MQTTClient(APITransport):
             else:
                 self.timestamp_deque.append(ts)
 
+    def send_status(self,
+                    status: Dict[str, Any],
+                    eventtime: float
+                    ) -> None:
+        if not status or not self.is_connected():
+            return
+        payload = {'eventtime': eventtime, 'status': status}
+        self.publish_topic(self.klipper_status_topic, payload)
+
     async def close(self) -> None:
         if self.reconnect_task is not None:
             self.reconnect_task.cancel()
             self.reconnect_task = None
         if not self.is_connected():
             return
+        await self.publish_topic(self.moonraker_status_topic,
+                                 {'server': 'offline'},
+                                 retain=True)
         self.disconnect_evt = asyncio.Event()
         self.client.disconnect()
         try:
