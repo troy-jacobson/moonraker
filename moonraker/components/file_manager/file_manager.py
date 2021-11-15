@@ -587,7 +587,6 @@ class FileManager:
 
         final_dest_path = upload_info['dest_path']
         logging.info(final_dest_path)
-        self.notify_sync_lock = NotifySyncLock(final_dest_path)
         pre_process_file = upload_info['tmp_file_path']
         logging.info(pre_process_file)
         # Does this need to mimic the way directories are created in _process_uploaded_file?
@@ -659,7 +658,8 @@ class FileManager:
             if e.status_code == 403:
                 raise self.server.error(
                     "File is loaded, upload not permitted", 403)
- 
+        self.notify_sync_lock = NotifySyncLock(upload_info['dest_path]'])
+
         logging.info("Awaiting pre-processing")
         await self._finish_gcode_upload_worker(upload_info)
 
